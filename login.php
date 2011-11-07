@@ -39,29 +39,51 @@ switch ($response)
 {
 	case "ERROR :: Connection Refused":
 		$saida['error']  = "Could not connect to " . HOSTNAME . ":" . HOSTPORT . " ($response).<br>";
-		$saida['error'] .= "Make sure monast.py is running so the panel can connect to its port properly.";
+		$saida['error'] .= "Make sure the Daemon is running so the panel can connect to its port properly.";
 		break;
 		
 	case "ERROR :: Request Not Found":
 		$saida['error']  = "The request to http://" . HOSTNAME . ":" . HOSTPORT . "/doAuthentication was not found.<br>";
-		$saida['error'] .= "Make sure monast.py is running so the panel can connect to its port properly.";
+		# $saida['error'] .= "Make sure monast.py is running so the panel can connect to its port properly.";
 		break;
 		
 	case "ERROR :: Internal Server Error":
 		$saida['error']  = "We got an \"Internal Server Error\" connecting to http://" . HOSTNAME . ":" . HOSTPORT . "/doAuthentication.<br>";
-		$saida['error'] .= "Please lookup log file and report errors at http://monast.sf.net";
+		# $saida['error'] .= "Please lookup log file and report errors at http://monast.sf.net";
 		break;
 		
 	case "ERROR :: Invalid Username/Secret":
 		$saida['error'] = "Invalid Username/Secret";
 		break;
-		
-	case "OK :: Authentication Success":
-		session_start();
-		setValor('login', true);
-		setValor('username', $username);
-		session_write_close();
-		$saida['success'] = true;
+				
+	default:
+		$obj = monast_json_decode($response);
+		// OLD AND BUSTED (legacy)
+		if($response == "OK :: Authentication Success")
+		{
+			session_start();
+			setValor('login', true);
+			setValor('username', $username);
+			session_write_close();
+			$saida['success'] = true;			
+		}
+		// NEW HOTNESS
+		else if(isset($obj) && isset($obj['result']) && $obj['result'])
+		{
+			session_start();
+			setValor('login', true);
+			setValor('username', $username);
+			setValor('roles', $obj['roles']);
+			session_write_close();
+			$saida['success'] = true;		
+		}
+		// FAILURE
+		else
+		{
+			$saida['error']  = "We got an \"Internal Server Error\" connecting to http://" . HOSTNAME . ":" . HOSTPORT . "/doAuthentication.<br>";
+			# $saida['error'] .= "Please lookup log file and report errors at http://monast.sf.net";			
+		}
+
 		break;
 } 
 
