@@ -302,6 +302,9 @@ class MonastHTTP(resource.Resource):
 		secret   = request.args.get('secret', [None])[0]
 		success  = False
 		
+		# change scope so we can get this after auth
+		authUser = {}
+		
 		if username != None and secret != None:
 			authUser = self.monast.authUsers.get(username)
 			if authUser:
@@ -319,7 +322,12 @@ class MonastHTTP(resource.Resource):
 		output = ""
 		if success:
 			log.log(logging.NOTICE, "User \"%s\" Successful Authenticated with Session \"%s\"" % (username, session.uid))
-			request.write("OK :: Authentication Success")
+			# request.write("OK :: Authentication Success")
+			resp = {
+				'result' : True,
+				'roles' : authUser.servers
+			}
+			request.write(json.dumps(resp, encoding = "ISO8859-1"))
 		else:
 			log.error("User \"%s\" Failed to Authenticate with session \"%s\"" % (username, session.uid))
 			request.write("ERROR :: Invalid Username/Secret")
@@ -581,20 +589,22 @@ class Monast:
 			'ChanSpyStop'         : self.handlerEventChanSpyStop,
 		}
 		
+		# Add fine(er) grained permissions
+		#  ** new additions [meetme,park,hangup]		
 		self.actionHandlers = {
 			'CliCommand'         : ('command', self.clientAction_CliCommand),
 			'RequestInfo'        : ('command', self.clientAction_RequestInfo),
 			'Originate'          : ('originate', self.clientAction_Originate),
 			'Transfer'           : ('originate', self.clientAction_Transfer),
-			'Park'               : ('originate', self.clientAction_Park),
-			'Hangup'       	     : ('originate', self.clientAction_Hangup),
+			'Park'               : ('park', self.clientAction_Park),
+			'Hangup'       	     : ('hangup', self.clientAction_Hangup),
 			'MonitorStart'       : ('originate', self.clientAction_MonitorStart),
 			'MonitorStop'        : ('originate', self.clientAction_MonitorStop),
 			'QueueMemberPause'   : ('queue', self.clientAction_QueueMemberPause),
 			'QueueMemberUnpause' : ('queue', self.clientAction_QueueMemberUnpause),
 			'QueueMemberAdd'     : ('queue', self.clientAction_QueueMemberAdd),
 			'QueueMemberRemove'  : ('queue', self.clientAction_QueueMemberRemove),
-			'MeetmeKick'         : ('originate', self.clientAction_MeetmeKick),
+			'MeetmeKick'         : ('meetme', self.clientAction_MeetmeKick),
 			'SpyChannel'         : ('spy', self.clientAction_SpyChannel),
 		}
 		
@@ -686,7 +696,7 @@ class Monast:
 					peer.peergroup = server.peergroups[channeltype][peername]
 				except:
 					if len(server.peergroups.keys()) > 0:
-						peer.peergroup = "No Group"
+						peer.peergroup = "Ungrouped"
 			
 			peer.context     = kw.get('context', server.default_context)
 			peer.variables   = kw.get('variables', [])
@@ -1338,6 +1348,7 @@ class Monast:
 			}
 			self.servers[servername].peergroups          = {}
 			self.servers[servername].displayUsers        = {}
+			self.servers[servername].displayUsersName    = {}
 			self.servers[servername].displayMeetmes      = {}
 			self.servers[servername].displayQueues       = {}
 			self.servers[servername].status.queues       = {}
@@ -1370,6 +1381,9 @@ class Monast:
 		
 		## Peers
 		self.displayUsersDefault = config.get('peers', 'default') == 'show'
+		self.displayUsersWithMask = False
+		self.displayUsersNameFromFreePBX = True
+		
 		try:
 			self.sortPeersBy = config.get('peers', 'sortby')
 			if not self.sortPeersBy in ('channel', 'callerid'):
@@ -1394,6 +1408,10 @@ class Monast:
 			tech, peer = user.split('/')
 			
 			if tech in server.status.peers.keys(): 
+				# check if peer has wildcard
+				if (re.match("^.*\*.*$",peer)):
+					self.displayUsersWithMask = True
+				# normal hide/show with default
 				if (self.displayUsersDefault and display == 'hide') or (not self.displayUsersDefault and display == 'show'):
 					server.displayUsers[user] = True
 					
@@ -2028,6 +2046,7 @@ class Monast:
 	##
 	## Event Handlers
 	##
+		
 	def handlerEventReload(self, ami, event):
 		log.debug("Server %s :: Processing Event Reload..." % ami.servername)
 		
@@ -2075,7 +2094,54 @@ class Monast:
 				
 		tech, chan = channel.split('/', 1)
 		self._updatePeer(ami.servername, channeltype = tech, peername = chan, dnd = dnd, _log = "DND (%s)" % status)
-		
+
+	def _smartTruncate(self,content, length=20, suffix='...'):
+		if len(content) <= length:
+			return content
+		else:
+			#return ' '.join(content[:length-len(suffix)].split(' ')[0:-1]) + suffix
+			return ' '.join(content[:length+1].split(' ')[0:-1]) + suffix
+
+	def fpbxPeerGetName(self,server,peername):
+		# find user portion of peer						
+		if(re.match("^.+\/.+$",peername)):
+			tech, user = peername.split('/', 1)
+		else:
+			user = peername
+
+		## Request Extension Display Name
+		def _onDBGetPeerName(result):
+			if(re.match("^Value\:\s.*$",result[0])):
+				# set peer name somehow? lol..
+				cidName = result[0].replace('Value: ','')
+				log.debug("Server %s :: Peer %s -> '%s'" %(server.servername, peername, cidName))
+				peer = server.status.peers[tech].get(user)
+				peer.callerid = "%s <%s>" % (self._smartTruncate(cidName), user)
+				peer.forcedCid = True
+
+		server.pushTask(server.ami.command, "database get AMPUSER %s/cidname" % user) \
+			.addCallbacks(_onDBGetPeerName, self._onAmiCommandFailure, errbackArgs = (server.servername, "Error Requesting FPBX Display Name"))
+
+	def shouldShowPeer(self,server,peername):		
+		# default / old way
+		if((self.displayUsersDefault and not server.displayUsers.has_key(peername)) or (not self.displayUsersDefault and server.displayUsers.has_key(peername))):
+			return True
+		# if we've got a mask, lets check it
+		elif (self.displayUsersWithMask):
+			# go through each user
+			for dispUserMask in server.displayUsers:
+				# skip if not mask
+				if(not re.match("^.*\*.*$",dispUserMask)):
+					continue
+				tUser = dispUserMask.replace('*','.')
+				# got mask, lets check it
+				if(re.match(tUser,peername) and not self.displayUsersDefault) or (not re.match(tUser,peername) and self.displayUsersDefault):
+					server.displayUsers[peername] = True
+					return True
+
+		# if we're here, false
+		return False
+				
 	def handlerEventPeerEntry(self, ami, event):
 		log.debug("Server %s :: Processing Event PeerEntry..." % ami.servername)
 		server      = self.servers.get(ami.servername)
@@ -2096,7 +2162,8 @@ class Monast:
 			
 		user = '%s/%s' % (channeltype, objectname)
 		
-		if (self.displayUsersDefault and not server.displayUsers.has_key(user)) or (not self.displayUsersDefault and server.displayUsers.has_key(user)):
+		# handle more complex peer filters
+		if(self.shouldShowPeer(server,user)):
 			self._createPeer(
 				ami.servername,
 				channeltype = channeltype,
@@ -2104,6 +2171,10 @@ class Monast:
 				status      = status,
 				time        = time
 			)
+			
+			# lookup peer name (DEFFERED) if FreePBX set
+			if(self.displayUsersNameFromFreePBX):
+				self.fpbxPeerGetName(server,user)
 		else:
 			user = None
 			
